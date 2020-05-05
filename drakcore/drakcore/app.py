@@ -54,14 +54,12 @@ def upload():
     with NamedTemporaryFile() as f:
         request.files['file'].save(f.name)
 
-        with open(f.name, "rb") as fr:
-            sample = Resource("sample", fr.read())
+        task = Task({"type": "sample", "stage": "recognized", "platform": "win32"})
+        task.payload["override_uid"] = task.uid
+        sample = Resource("sample", path=f.name)
+        task.add_payload("sample", sample)
+        producer.send_task(task)
 
-    task = Task({"type": "sample", "stage": "recognized", "platform": "win32"})
-    task.payload["override_uid"] = task.uid
-    task.add_resource("sample", sample)
-
-    producer.send_task(task)
     return jsonify({"task_uid": task.uid})
 
 
