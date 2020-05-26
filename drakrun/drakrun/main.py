@@ -16,7 +16,7 @@ import json
 import re
 import io
 import magic
-from karton2 import Karton, Config, Task, DirectoryResource, RemoteResource
+from karton2 import Karton, Config, Task, LocalResource
 from stat import S_ISREG, ST_CTIME, ST_MODE, ST_SIZE
 import drakrun.run as d_run
 from drakrun.drakparse import parse_logs
@@ -235,18 +235,24 @@ class DrakrunKarton(Karton):
             if os.path.isfile(file_path):
                 object_name = os.path.join(analysis_uid, subdir, fn)
                 res_name = os.path.join(subdir, fn)
-                self.minio.fput_object('drakrun', object_name, file_path)
-                yield RemoteResource(name=res_name, bucket='drakrun', _uid=object_name)
+                resource = LocalResource(name=res_name, bucket='drakrun', path=file_path)
+                resource._uid = object_name
+                yield resource
             elif os.path.isdir(file_path):
                 yield from self.upload_artifacts(analysis_uid, workdir, os.path.join(subdir, fn))
 
     def process(self):
         sample = self.current_task.get_resource("sample")
-        local_sample = self.download_resource(sample)
         self.log.info("hostname: {}".format(socket.gethostname()))
-        sha256sum = hashlib.sha256(local_sample.content).hexdigest()
-        magic_output = magic.from_buffer(local_sample.content)
+        sha256sum = hashlib.sha256(sample.content).hexdigest()
+        magic_output = magic.from_buffer(sample.content)
         self.log.info("running sample sha256: {}".format(sha256sum))
+
+        timeout = self.current_task.payload.get('timeout') or 60 * 10
+        hard_time_limit = 60 * 20
+        if timeout > hard_time_limit:
+            self.log.error("Tried to run the analysis for more than hard limit of %d seconds", hard_time_limit)
+            return
 
         analysis_uid = self.current_task.uid
         override_uid = self.current_task.payload.get('override_uid')
@@ -263,7 +269,7 @@ class DrakrunKarton(Karton):
         start_command = 'start malwar.{}'.format(extension)
 
         if extension == 'dll':
-            run_command = self._get_dll_run_command(local_sample.content)
+            run_command = self._get_dll_run_command(sample.content)
 
             if not run_command:
                 self.log.info('Unable to run malware sample, could not generate any suitable command to run it.')
@@ -290,13 +296,13 @@ class DrakrunKarton(Karton):
         }
 
         with open(os.path.join(outdir, 'sample_sha256.txt'), 'w') as f:
-            f.write(hashlib.sha256(local_sample.content).hexdigest())
+            f.write(hashlib.sha256(sample.content).hexdigest())
 
         with open(os.path.join(workdir, 'run.bat'), 'wb') as f:
             f.write(b'ipconfig /renew\r\nxcopy D:\\malwar.' + extension.encode('ascii') + b' %USERPROFILE%\\Desktop\\\r\nC:\r\ncd %USERPROFILE%\\Desktop\r\n' + start_command.encode('ascii'))
 
         with open(os.path.join(workdir, 'malwar.{}'.format(extension)), 'wb') as f:
-            f.write(local_sample.content)
+            f.write(sample.content)
 
         try:
             subprocess.run(["genisoimage", "-o", os.path.join(workdir, 'malwar.iso'), os.path.join(workdir, 'malwar.{}'.format(extension)), os.path.join(workdir, 'run.bat')], cwd=workdir, check=True)
@@ -337,7 +343,7 @@ class DrakrunKarton(Karton):
                                "-x", "poolmon",
                                "-x", "objmon",
                                "-j", "5",
-                               "-t", "600",
+                               "-t", str(timeout),
                                "-i", inject_pid,
                                "-k", kpgd,
                                "-d", "vm-{vm_id}".format(vm_id=INSTANCE_ID),
@@ -354,7 +360,7 @@ class DrakrunKarton(Karton):
                     drakvuf = subprocess.Popen(drakvuf_cmd, stdout=drakmon_log)
 
                     try:
-                        exit_code = drakvuf.wait(660)
+                        exit_code = drakvuf.wait(timeout + 60)
                     except subprocess.TimeoutExpired as e:
                         logging.error("BUG: Monitor command doesn\'t terminate automatically after timeout expires.")
                         logging.error("Trying to terminate DRAKVUF...")
@@ -415,9 +421,9 @@ class DrakrunKarton(Karton):
         )
 
         for resource in self.upload_artifacts(analysis_uid, workdir):
-            t.add_resource(resource.name, resource)
+            t.add_payload(resource.name, resource)
 
-        t.add_resource('sample', sample)
+        t.add_payload('sample', sample)
         self.send_task(t)
 
 

@@ -8,6 +8,7 @@ import pytest
 
 from pathlib import Path
 from fabric import task, Connection, Config
+from invoke.exceptions import UnexpectedExit
 from minio import Minio
 from minio.error import ResponseError
 
@@ -58,6 +59,14 @@ DRAKVUF_DEPS = [
     "libjson-c3",
     "libyajl2",
     "libaio1",
+]
+
+DRAKMON_SERVICES = [
+    "drak-system.service",
+    "drak-minio.service",
+    "drak-web.service",
+    "drak-postprocess.service",
+    "redis-server.service",
 ]
 
 vm_runner = VMRunner(VM_RUNNER_HOST)
@@ -177,3 +186,28 @@ def drakmon_vm():
         c.run("brctl addbr drak0")
 
     return Connection("testvm", config=FABRIC_CONFIG)
+
+
+@pytest.fixture(scope="session")
+def karton_bucket(drakmon_vm):
+    """ Wait up to 10 seconds until karton2 bucket appears """
+    for _ in range(10):
+        try:
+            drakmon_vm.run("[[ -f /var/lib/drakcore/minio/karton2 ]]")
+            drakmon_vm.run("[[ -f /var/lib/drakcore/minio/drakrun ]]")
+            break
+        except UnexpectedExit:
+            time.sleep(1.0)
+
+    return None
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """ Dump logs if we're going to exit with an error """
+    if exitstatus == 0:
+        return
+
+    print("Testing finished with errors, collecting logs")
+    with Connection("testvm", config=FABRIC_CONFIG) as c:
+        for service in DRAKMON_SERVICES:
+            c.run(f"journalctl -u {service}")

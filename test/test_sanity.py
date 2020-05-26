@@ -1,11 +1,10 @@
 import time
 import json
 import requests
+import pytest
 
 from utils import get_hypervisor_type, get_service_info, Drakcore
-from conftest import VM_HOST
-
-import pytest
+from conftest import VM_HOST, DRAKMON_SERVICES
 
 
 def test_running_on_xen(drakmon_vm):
@@ -13,18 +12,24 @@ def test_running_on_xen(drakmon_vm):
 
 
 def test_services_running(drakmon_vm):
-    infos = (
-        get_service_info(drakmon_vm, "drak-system.service"),
-        get_service_info(drakmon_vm, "drak-minio.service"),
-        get_service_info(drakmon_vm, "drak-web.service"),
-        get_service_info(drakmon_vm, "drak-postprocess.service"),
-        get_service_info(drakmon_vm, "redis-server.service"),
-    )
+    def check_status():
+        infos = [get_service_info(drakmon_vm, service) for service in DRAKMON_SERVICES]
 
-    for info in infos:
-        assert info["LoadState"] == "loaded"
-        assert info["ActiveState"] == "active"
-        assert info["SubState"] == "running"
+        for info in infos:
+            assert info["LoadState"] == "loaded"
+            assert info["ActiveState"] == "active"
+            assert info["SubState"] == "running"
+
+    # Wait up to 5 seconds for the services to be up
+    for _ in range(5):
+        try:
+            check_status()
+            break
+        except AssertionError:
+            pass
+        time.sleep(1.0)
+    else:
+        raise Exception("Services down")
 
 
 def test_web_ui_reachable(drakmon_vm):
@@ -33,12 +38,12 @@ def test_web_ui_reachable(drakmon_vm):
 
 
 @pytest.fixture
-def drakcore():
+def drakcore(karton_bucket):
     return Drakcore(f"http://{VM_HOST}:6300")
 
 
 def test_sample_analysis(drakmon_vm, drakcore):
-    task_uuid = drakcore.upload(open("test.exe", "rb"))
+    task_uuid = drakcore.upload(open("test.exe", "rb"), timeout=120)
 
     # wait until end of analysis
     while True:
