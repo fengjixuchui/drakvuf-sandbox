@@ -36,13 +36,12 @@ def route_list():
 
     for obj in res:
         try:
-            meta = minio.get_object("drakrun", os.path.join(
-                obj.object_name, "metadata.json"))
-        except minio.error.NoSuchKey:
+            tmp = minio.get_object("drakrun", os.path.join(obj.object_name, "metadata.json"))
+            meta = json.loads(tmp.read())
+        except NoSuchKey:
             meta = {}
 
-        analyses.append({"id": obj.object_name.strip('/'),
-                         "meta": json.loads(meta.read())})
+        analyses.append({"id": obj.object_name.strip('/'), "meta": meta})
 
     return jsonify(sorted(analyses, key=lambda o: o.get('meta', {}).get('time_finished', 0), reverse=True))
 
@@ -60,9 +59,20 @@ def upload():
     task = Task({"type": "sample", "stage": "recognized", "platform": "win32"})
     task.add_resource("override_uid", task.uid)
 
+    # Add analysis timeout to task
     timeout = request.form.get("timeout")
     if timeout:
         task.add_resource("timeout", int(timeout))
+
+    # Add filename override to task
+    filename = request.form.get("file_name")
+    if filename:
+        task.add_resource("file_name", filename)
+
+    # Add startup command to task
+    start_command = request.form.get("start_command")
+    if start_command:
+        task.add_resource("start_command", filename)
 
     task.add_resource("sample", sample)
     producer.send_task(task)
@@ -94,6 +104,13 @@ def apicall(task_uid, pid):
 def logs(task_uid, log_type):
     with NamedTemporaryFile() as f:
         minio.fget_object("drakrun", task_uid + "/" + log_type + ".log", f.name)
+        return send_file(f.name, mimetype='text/plain')
+
+
+@app.route("/dumps/<task_uid>")
+def dumps(task_uid):
+    with NamedTemporaryFile() as f:
+        minio.fget_object("drakrun", task_uid + "/" + "dumps.zip", f.name)
         return send_file(f.name, mimetype='text/plain')
 
 

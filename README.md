@@ -21,9 +21,10 @@ In order to run DRAKVUF Sandbox, your setup must fullfill all of the listed requ
 
 Nested virtualization:
 
-* KVM, Hyper-v are **not** supported
-* because of the above, hosting drakvuf-sandbox in cloud is also **not** supported (because most hosting providers use one of the above)
-* however, nested Xen **does** work
+* KVM **does** work, however it is considered experimental. If you experience any bugs, please report them to us for further investigation.
+* Due to lack of exposed CPU features, hosting drakvuf-sandbox in cloud is **not** supported (although it might change in the future)
+* Hyper-V does **not** work
+* Xen **does** work out of the box
 * VMware Workstation Player **does** work, but you need to check Virtualize EPT option for a VM; Intel processor with EPT still required
 
 ### Basic installation
@@ -153,6 +154,8 @@ Feel free to contact us if you have any questions or comments.
 * Michał Leszczyński - monk@cert.pl
 * Adam Kliś - bonus@cert.pl
 * Hubert Jasudowicz - chivay@cert.pl
+
+You can also reach us on IRC - [#drakvuf-sandbox@irc.freenode.net](https://webchat.freenode.net/#drakvuf-sandbox).
 
 If you have any questions about [DRAKVUF](https://drakvuf.com/) engine itself, contact tamas@tklengyel.com
 
