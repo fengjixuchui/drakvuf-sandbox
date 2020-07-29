@@ -10,23 +10,17 @@ import random
 import subprocess
 import string
 import tempfile
-import time
 from shutil import copyfile
 
 import requests
-from drakrun.drakpdb import fetch_pdb, make_pdb_profile, dll_file_list, pdb_guid
 from requests import RequestException
+from drakrun.drakpdb import fetch_pdb, make_pdb_profile, dll_file_list, pdb_guid
+from drakrun.config import ETC_DIR, LIB_DIR, InstallInfo
+from drakrun.storage import get_storage_backend, REGISTERED_BACKEND_NAMES
 
 logging.basicConfig(level=logging.DEBUG,
                     format='[%(asctime)s][%(levelname)s] %(message)s',
                     handlers=[logging.StreamHandler()])
-
-# this can be overriden by launcher
-LIB_DIR = os.path.dirname(os.path.realpath(__file__))
-ETC_DIR = os.path.dirname(os.path.realpath(__file__))
-MAIN_DIR = os.path.dirname(os.path.realpath(__file__))
-
-FNULL = open(os.devnull, 'w')
 
 
 def find_default_interface():
@@ -110,15 +104,16 @@ def install(storage_backend, disk_size, iso_path, zfs_tank_name, max_vms, unatte
 
         iso_sha256 = sha256_hash.hexdigest()
 
-    with open(os.path.join(ETC_DIR, "install.json"), "w") as f:
-        install_info = {"storage_backend": storage_backend,
-                        "disk_size": disk_size,
-                        "iso_path": os.path.abspath(iso_path),
-                        "zfs_tank_name": zfs_tank_name,
-                        "max_vms": max_vms,
-                        "enable_unattended": unattended_xml is not None,
-                        "iso_sha256": iso_sha256}
-        f.write(json.dumps(install_info, indent=4))
+    install_info = InstallInfo(
+        storage_backend=storage_backend,
+        disk_size=disk_size,
+        iso_path=os.path.abspath(iso_path),
+        zfs_tank_name=zfs_tank_name,
+        max_vms=max_vms,
+        enable_unattended=unattended_xml is not None,
+        iso_sha256=iso_sha256
+    )
+    install_info.save()
 
     logging.info("Checking xen-detect...")
     proc = subprocess.run('xen-detect -N', shell=True)
@@ -145,54 +140,8 @@ def install(storage_backend, disk_size, iso_path, zfs_tank_name, max_vms, unatte
 
     generate_vm_conf(install_info, 0)
 
-    if storage_backend == "qcow2":
-        try:
-            subprocess.check_output("qemu-img --version", shell=True)
-        except subprocess.CalledProcessError:
-            logging.exception("Failed to determine qemu-img version. Make sure you have qemu-utils installed.")
-            return
-
-        try:
-            subprocess.check_output(' '.join([
-                "qemu-img",
-                "create",
-                "-f",
-                "qcow2",
-                os.path.join(LIB_DIR, "volumes/vm-0.img"),
-                shlex.quote(disk_size)
-            ]), shell=True)
-        except subprocess.CalledProcessError:
-            logging.exception("Failed to create a new volume using qemu-img.")
-            return
-    elif storage_backend == "zfs":
-        try:
-            subprocess.check_output("zfs -?", shell=True)
-        except subprocess.CalledProcessError:
-            logging.exception("Failed to execute zfs command. Make sure you have ZFS support installed.")
-            return
-
-        vm0_vol = shlex.quote(os.path.join(zfs_tank_name, 'vm-0'))
-
-        try:
-            subprocess.check_output(f"zfs destroy -Rfr {vm0_vol}", stderr=subprocess.STDOUT, shell=True)
-        except subprocess.CalledProcessError as e:
-            if b'dataset does not exist' not in e.output:
-                logging.exception(f"Failed to destroy the existing ZFS volume {vm0_vol}.")
-                return
-
-        try:
-            subprocess.check_output(' '.join([
-                "zfs",
-                "create",
-                "-V",
-                shlex.quote(disk_size),
-                shlex.quote(os.path.join(zfs_tank_name, 'vm-0'))
-            ]), shell=True)
-        except subprocess.CalledProcessError:
-            logging.exception("Failed to create a new volume using zfs create.")
-            return
-    else:
-        raise RuntimeError('Unknown storage backend type.')
+    backend = get_storage_backend(install_info)
+    backend.initialize_vm0_volume(disk_size)
 
     try:
         subprocess.check_output("brctl show", shell=True)
@@ -246,67 +195,18 @@ def send_usage_report(report):
         logging.exception("Failed to send usage report. This is not a serious problem.")
 
 
-def create_rekall_profiles(install_info):
-    profiles_path = os.path.join(LIB_DIR, "profiles")
+def create_rekall_profiles(install_info: InstallInfo):
+    storage_backend = get_storage_backend(install_info)
+    with storage_backend.vm0_root_as_block() as block_device, \
+         tempfile.TemporaryDirectory() as mount_path:
+        mnt_path_quoted = shlex.quote(mount_path)
+        blk_quoted = shlex.quote(block_device)
+        try:
+            subprocess.check_output(f"mount -t ntfs -o ro {blk_quoted} {mnt_path_quoted}", shell=True)
+        except subprocess.CalledProcessError:
+            raise RuntimeError(f"Failed to mount {block_device} as NTFS.")
 
-    with tempfile.TemporaryDirectory() as mount_path:
-        # we mount 2nd partition, as 1st partition is windows boot related and 2nd partition is C:\\
-
-        if install_info["storage_backend"] == "zfs":
-            # workaround for not being able to mount a snapshot
-            base_snap = shlex.quote(os.path.join(install_info["zfs_tank_name"], 'vm-0@booted'))
-            tmp_snap = shlex.quote(os.path.join(install_info["zfs_tank_name"], 'tmp'))
-            try:
-                subprocess.check_output(f'zfs clone {base_snap} {tmp_snap}', shell=True)
-            except subprocess.CalledProcessError:
-                logging.warning("Failed to clone temporary zfs snapshot. Aborting generation of usermode rekall profiles")
-                return
-
-            volume_path = os.path.join("/", "dev", "zvol", install_info["zfs_tank_name"], "tmp-part2")
-            # Wait for 60s for the volume to appear in /dev/zvol/...
-            for _ in range(60):
-                if os.path.exists(volume_path):
-                    break
-                time.sleep(1.0)
-            else:
-                raise RuntimeError(f"ZFS volume not available at {volume_path}")
-
-            try:
-                # We have to wait for a moment for zvol to appear
-                time.sleep(1.0)
-                tmp_mount = shlex.quote(volume_path)
-                subprocess.check_output(f'mount -t ntfs -o ro {tmp_mount} {mount_path}', shell=True)
-            except subprocess.CalledProcessError:
-                logging.warning("Failed to mount temporary zfs snapshot. Aborting generation of usermode rekall profiles")
-                try:
-                    subprocess.check_output(f'zfs destroy {tmp_snap}', shell=True)
-                except subprocess.CalledProcessError:
-                    logging.exception('Failed to cleanup after zfs tmp snapshot')
-                return
-        else:  # qcow2
-            try:
-                subprocess.check_output("modprobe nbd", shell=True)
-            except subprocess.CalledProcessError:
-                logging.warning("Failed to load nbd kernel module. Aborting generation of usermode rekall profiles")
-                return
-
-            # TODO: this assumes /dev/nbd0 is free
-            try:
-                subprocess.check_output(f"qemu-nbd -c /dev/nbd0 --read-only {os.path.join(LIB_DIR, 'volumes', 'vm-0.img')}", shell=True)
-            except subprocess.CalledProcessError:
-                logging.warning("Failed to load quemu image as nbd0. Aborting generation of usermode rekall profiles")
-                return
-
-            try:
-                subprocess.check_output(f"mount -t ntfs -o ro /dev/nbd0p2 {mount_path}", shell=True)
-            except subprocess.CalledProcessError:
-                logging.warning("Failed to mount nbd0p2. Aborting generation of usermode rekall profiles")
-                try:
-                    subprocess.check_output('qemu-nbd --disconnect /dev/nbd0', shell=True)
-                except subprocess.CalledProcessError:
-                    logging.exception('Failed to cleanup after nbd0')
-                return
-
+        profiles_path = os.path.join(LIB_DIR, "profiles")
         for file in dll_file_list:
             try:
                 logging.info(f"Fetching rekall profile for {file.path}")
@@ -333,22 +233,15 @@ def create_rekall_profiles(install_info):
                     os.remove(os.path.join(profiles_path, tmp))
 
         # cleanup
-        subprocess.check_output(f'umount {mount_path}', shell=True)
-
-    if install_info["storage_backend"] == "zfs":
-        subprocess.check_output(f'zfs destroy {tmp_snap}', shell=True)
-    else:  # qcow2
-        subprocess.check_output('qemu-nbd --disconnect /dev/nbd0', shell=True)
+        subprocess.check_output(f'umount {mnt_path_quoted}', shell=True)
 
 
 def generate_profiles(no_report=False, generate_usermode=True):
     if os.path.exists(os.path.join(ETC_DIR, "no_usage_reports")):
         no_report = True
 
-    with open(os.path.join(ETC_DIR, "install.json"), 'r') as f:
-        install_info = json.loads(f.read())
-
-    max_vms = install_info["max_vms"]
+    install_info = InstallInfo.load()
+    max_vms = install_info.max_vms
     output = subprocess.check_output(['vmi-win-guid', 'name', 'vm-0'], timeout=30).decode('utf-8')
 
     try:
@@ -386,7 +279,8 @@ def generate_profiles(no_report=False, generate_usermode=True):
         logging.error("Failed to obtain KPGD value.")
         return
 
-    pid_tool = os.path.join(MAIN_DIR, "tools", "get-explorer-pid")
+    module_dir = os.path.dirname(os.path.realpath(__file__))
+    pid_tool = os.path.join(module_dir, "tools", "get-explorer-pid")
     explorer_pid_s = subprocess.check_output([pid_tool, "vm-0", kernel_profile, offsets_dict['kpgd']], timeout=30).decode('ascii', 'ignore')
     m = re.search(r'explorer\.exe:([0-9]+)', explorer_pid_s)
     explorer_pid = m.group(1)
@@ -397,18 +291,19 @@ def generate_profiles(no_report=False, generate_usermode=True):
     with open(os.path.join(LIB_DIR, 'profiles', 'runtime.json'), 'w') as f:
         f.write(json.dumps(runtime_profile, indent=4))
 
-    # TODO (optional) making usermode profiles (a special tool for GUID extraction is required)
     logging.info("Saving VM snapshot...")
     subprocess.check_output('xl save vm-0 ' + os.path.join(LIB_DIR, "volumes", "snapshot.sav"), shell=True)
 
+    storage_backend = get_storage_backend(install_info)
+    storage_backend.snapshot_vm0_volume()
     logging.info("Snapshot was saved succesfully.")
 
-    if install_info["storage_backend"] == 'zfs':
-        snap_name = shlex.quote(os.path.join(install_info["zfs_tank_name"], 'vm-0@booted'))
-        subprocess.check_output(f'zfs snapshot {snap_name}', shell=True)
-
     if generate_usermode:
-        create_rekall_profiles(install_info)
+        try:
+            create_rekall_profiles(install_info)
+        except RuntimeError as e:
+            logging.warning("Generating usermode profiles failed")
+            logging.exception(e)
 
     for vm_id in range(max_vms + 1):
         # we treat vm_id=0 as special internal one
@@ -422,7 +317,7 @@ def generate_profiles(no_report=False, generate_usermode=True):
                 "version": version
             },
             "install_iso": {
-                "sha256": install_info["iso_sha256"]
+                "sha256": install_info.iso_sha256
             }
         })
 
@@ -431,44 +326,32 @@ def generate_profiles(no_report=False, generate_usermode=True):
 
 
 def reenable_services():
-    if not os.path.exists(os.path.join(ETC_DIR, "install.json")):
+    install_info = InstallInfo.try_load()
+    if not install_info:
         logging.info("Not re-enabling services, install.json is missing.")
         return
-
-    with open(os.path.join(ETC_DIR, "install.json"), 'r') as f:
-        install_info = json.loads(f.read())
-
-    max_vms = install_info["max_vms"]
 
     subprocess.check_output('systemctl disable \'drakrun@*\'', shell=True, stderr=subprocess.STDOUT)
     subprocess.check_output('systemctl stop \'drakrun@*\'', shell=True, stderr=subprocess.STDOUT)
 
-    for vm_id in range(1, max_vms + 1):
+    for vm_id in range(1, install_info.max_vms + 1):
         logging.info("Enabling and starting drakrun@{}...".format(vm_id))
         subprocess.check_output('systemctl enable drakrun@{}'.format(vm_id), shell=True, stderr=subprocess.STDOUT)
         subprocess.check_output('systemctl restart drakrun@{}'.format(vm_id), shell=True, stderr=subprocess.STDOUT)
 
 
-def generate_vm_conf(install_info, vm_id):
-    iso_path = install_info['iso_path']
-    storage_backend = install_info['storage_backend']
-    zfs_tank_name = install_info['zfs_tank_name']
-
+def generate_vm_conf(install_info: InstallInfo, vm_id: int):
     with open(os.path.join(ETC_DIR, 'scripts/cfg.template'), 'r') as f:
         template = f.read()
 
+    storage_backend = get_storage_backend(install_info)
+
     disks = []
+    disks.append(storage_backend.get_vm_disk_path(vm_id))
 
-    if storage_backend == "zfs":
-        disks.append('phy:/dev/zvol/{tank_name}/vm-{vm_id},hda,w'.format(tank_name=zfs_tank_name, vm_id=vm_id))
-    elif storage_backend == "qcow2":
-        disks.append('tap:qcow2:{main_dir}/volumes/vm-{vm_id}.img,xvda,w'.format(main_dir=LIB_DIR, vm_id=vm_id))
-    else:
-        raise RuntimeError('Unknown storage backend.')
+    disks.append('file:{iso},hdc:cdrom,r'.format(iso=os.path.abspath(install_info.iso_path)))
 
-    disks.append('file:{iso},hdc:cdrom,r'.format(iso=os.path.abspath(iso_path)))
-
-    if install_info['enable_unattended']:
+    if install_info.enable_unattended:
         disks.append('file:{main_dir}/volumes/unattended.iso,hdd:cdrom,r'.format(main_dir=LIB_DIR))
 
     disks = ', '.join(['"{}"'.format(disk) for disk in disks])
@@ -491,7 +374,7 @@ def main():
 
     install_p = subparsers.add_parser('install', help='Install guest Virtual Machine')
     install_p.set_defaults(which='install')
-    install_p.add_argument('--storage-backend', default='qcow2', type=str, help='Storage backend (default: qcow2)')
+    install_p.add_argument('--storage-backend', default='qcow2', choices=REGISTERED_BACKEND_NAMES, help='Storage backend (default: qcow2)')
     install_p.add_argument('--disk-size', default='100G', type=str, help='Disk size (default: 100G)')
     install_p.add_argument('--zfs-tank-name', type=str, help='Tank name (only for zfs storage backend)')
     install_p.add_argument('--max-vms', default=1, type=int, help='Maximum number of simultaneous VMs (default: 1)')
@@ -516,12 +399,19 @@ def main():
         logging.warning('Not running as root, draksetup may work improperly!')
 
     if args.which == "install":
-        install(storage_backend=args.storage_backend,
-                disk_size=args.disk_size,
-                iso_path=args.iso,
-                zfs_tank_name=args.zfs_tank_name,
-                max_vms=args.max_vms,
-                unattended_xml=args.unattended_xml)
+        if args.storage_backend != "zfs" and args.zfs_tank_name is not None:
+            parser.error("--zfs-tank-name is meaningful only for ZFS storage backend")
+
+        try:
+            install(storage_backend=args.storage_backend,
+                    disk_size=args.disk_size,
+                    iso_path=args.iso,
+                    zfs_tank_name=args.zfs_tank_name,
+                    max_vms=args.max_vms,
+                    unattended_xml=args.unattended_xml)
+        except RuntimeError as e:
+            logging.exception(e)
+
     elif args.which == "postinstall":
         generate_profiles(args.no_report, args.generate_usermode)
     elif args.which == "postupgrade":
