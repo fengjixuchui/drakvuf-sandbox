@@ -182,12 +182,12 @@ class DrakrunKarton(Karton):
         max_total_size = 300 * 1024 * 1024  # 300 MB
         current_size = 0
 
-        for cdate, path, size in sorted(entries):
+        for _, path, size in sorted(entries):
             current_size += size
 
             if current_size <= max_total_size:
-                zipf.write(path)
-
+                # Store files under dumps/
+                zipf.write(path, os.path.join("dumps", os.path.basename(path)))
             os.unlink(path)
 
         if current_size > max_total_size:
@@ -282,6 +282,8 @@ class DrakrunKarton(Karton):
             analysis_uid = override_uid
             self.log.info(f"override UID: {override_uid}")
             self.log.info("note that artifacts will be stored under this overriden identifier")
+
+        self.rs.set(f"drakvnc:{analysis_uid}", INSTANCE_ID, ex=3600)  # 1h
 
         workdir = '/tmp/drakrun/vm-{}'.format(int(INSTANCE_ID))
 
