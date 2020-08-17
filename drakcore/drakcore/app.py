@@ -58,24 +58,32 @@ def upload():
             sample = Resource("sample", fr.read())
 
     task = Task({"type": "sample", "stage": "recognized", "platform": "win32"})
-    task.add_resource("override_uid", task.uid)
+    task.add_payload("override_uid", task.uid)
 
     # Add analysis timeout to task
     timeout = request.form.get("timeout")
     if timeout:
-        task.add_resource("timeout", int(timeout))
+        task.add_payload("timeout", int(timeout))
 
     # Add filename override to task
-    filename = request.form.get("file_name")
-    if filename:
-        task.add_resource("file_name", filename)
+    if request.form.get("file_name"):
+        filename = request.form.get("file_name")
+    else:
+        filename = request.files['file'].filename
+    task.add_payload("file_name", os.path.splitext(filename)[0])
+
+    # Extract and add extension
+    extension = os.path.splitext(filename)[1][1:]
+    if extension:
+        task.headers['extension'] = extension
 
     # Add startup command to task
     start_command = request.form.get("start_command")
     if start_command:
-        task.add_resource("start_command", start_command)
+        task.add_payload("start_command", start_command)
 
     task.add_resource("sample", sample)
+
     producer.send_task(task)
 
     return jsonify({"task_uid": task.uid})
@@ -132,6 +140,13 @@ def graph(task_uid):
         except NoSuchKey:
             return jsonify(None)
         return send_file(f.name, mimetype='text/plain')
+
+
+@app.route("/metadata/<task_uid>")
+def metadata(task_uid):
+    tmp = minio.get_object("drakrun", f"{task_uid}/metadata.json")
+    meta = json.loads(tmp.read())
+    return jsonify(meta)
 
 
 @app.route("/status/<task_uid>")

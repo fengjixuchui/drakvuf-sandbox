@@ -1,7 +1,7 @@
 import axios from "axios";
 
-// uncomment this line to use different API server
-// axios.defaults.baseURL = '';
+// Set REACT_APP_API_SERVER env to override default API server URL
+axios.defaults.baseURL = process.env.REACT_APP_API_SERVER;
 
 export default {
   async getList() {
@@ -12,6 +12,9 @@ export default {
   },
   async listLogs(analysis) {
     return axios.get(`/logs/${analysis}`);
+  },
+  async getMetadata(analysis) {
+    return axios.get(`/metadata/${analysis}`);
   },
   async getStatus(analysis) {
     return axios.get(`/status/${analysis}`);
