@@ -50,12 +50,12 @@ class Regmon(Base):
 
         method = switcher.get(obj["Method"], "Unknown")
 
-        if "ValueName" in obj:
+        if obj.get("ValueName"):
             key = f"{obj['Key']}\\{obj['ValueName']}"
         else:
             key = obj["Key"]
 
-        if "Value" in obj:
+        if obj.get("Value"):
             detail = f"Type: REG_BINARY, Length: {len(obj['Value'].replace(' ', ''))}, Data: {obj['Value']}"
         else:
             detail = ""
@@ -72,7 +72,7 @@ class Regmon(Base):
 class Procmon(Base):
     def __init__(self, obj: Dict):
         if obj["Method"] == "NtCreateUserProcess":
-            super().__init__(obj, "Process Create", obj["ImagePathName"], detail=f'PID: {obj["NewPid"]}, Command line: {obj["CmdLine"]}')
+            super().__init__(obj, "Process Create", obj["ImagePathName"], detail=f'PID: {obj["NewPid"]}, Command line: {obj["CommandLine"]}')
 
         # fallback
         if not hasattr(self, "valid") or not self.valid:
@@ -81,17 +81,17 @@ class Procmon(Base):
 
 class FileTracer(Base):
     def __init__(self, obj: Dict):
-        if obj["Method"] == "NtCreateFile":
+        if obj.get("Method") == "NtCreateFile":
             super().__init__(obj, "CreateFile", obj["FileName"], detail="OpenResult: Created, Non-Directory File")
 
-        if obj["Method"] == "NtSetInformationFile":
+        if obj.get("Method") == "NtSetInformationFile":
             if "SrcFileName" in obj and "DstFileName" in obj:
                 super().__init__(obj, "SetRenameInformationFile", obj["SrcFileName"], detail='FileName: {}'.format(obj["DstFileName"]))
 
-        if obj["Method"] == "NtWriteFile":
+        if obj.get("Method") == "NtWriteFile":
             super().__init__(obj, "WriteFile", obj["FileName"])
 
-        if obj["Method"] == "NtReadFile":
+        if obj.get("Method") == "NtReadFile":
             super().__init__(obj, "ReadFile", obj["FileName"])
 
         # fallback
@@ -168,16 +168,16 @@ def parse_logs(lines: Iterable[Union[bytes, str]]) -> Generator[str, None, None]
 
         try:
             plugin = line_obj["Plugin"]
-        except KeyError as e:
-            logging.warning(f"line is missng plugin name!\n{e}")
+        except KeyError:
+            logging.warning(f"BUG: Line is missing plugin name!\n{line}")
             continue
 
         if plugin in switcher:
             plugin_obj = switcher[plugin]
             try:
                 converted = str(plugin_obj(line_obj))
-            except Exception as e:
-                logging.warning(f"Failed to parse log entry:\n{e}")
+            except Exception:
+                logging.exception(f"BUG: Failed to parse log entry.\n{line}")
                 continue
 
             if converted:
