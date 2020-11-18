@@ -4,10 +4,9 @@ import json
 import functools
 from io import StringIO
 
-from karton2 import Consumer, Config, Karton, LocalResource
-from minio.error import NoSuchKey
+from karton2 import Consumer, Karton, RemoteResource, LocalResource
 from drakcore.postprocess import REGISTERED_PLUGINS
-from drakcore.util import find_config
+from drakcore.util import get_config
 
 
 class LocalLogBuffer(logging.Handler):
@@ -70,6 +69,7 @@ class AnalysisProcessor(Consumer):
         if len(enabled_plugins) == 0:
             raise ValueError("No plugins enabled")
         self.plugins = enabled_plugins
+        self.log.setLevel(logging.INFO)
 
     @with_logs('drak-postprocess.log')
     def process(self):
@@ -82,14 +82,20 @@ class AnalysisProcessor(Consumer):
                 continue
 
             try:
-                self.log.info("Running postprocess - %s", plugin.handler.__name__)
-                plugin.handler(self.current_task, task_resources, self.minio)
+                self.log.debug("Running postprocess - %s", plugin.handler.__name__)
+                outputs = plugin.handler(self.current_task, task_resources, self.minio)
+
+                if outputs:
+                    for out in outputs:
+                        self.log.debug(f"Step {plugin.handler.__name__} outputted new resource: {out}")
+                        res_name = os.path.join(self.current_task.payload["analysis_uid"], out)
+                        task_resources[out] = RemoteResource(res_name, uid=res_name, bucket='drakrun', minio=self.minio)
             except Exception:
                 self.log.error("Postprocess failed", exc_info=True)
 
 
 def main():
-    conf = Config(find_config())
+    conf = get_config()
     processor = AnalysisProcessor(conf, REGISTERED_PLUGINS)
     processor.loop()
 

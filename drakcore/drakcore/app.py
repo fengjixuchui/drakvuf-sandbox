@@ -1,25 +1,40 @@
 import json
 import os
 import re
+import pathlib
 from tempfile import NamedTemporaryFile
 
 import requests
 import logging
 
-from flask import Flask, jsonify, request, send_file, send_from_directory, abort
-from minio.error import NoSuchKey
+from flask import Flask, jsonify, request, send_file, redirect, send_from_directory, Response, abort
 from karton2 import Config, Producer, Task, Resource
+from minio.error import NoSuchKey
 
 from drakcore.system import SystemService
-from drakcore.util import find_config
+from drakcore.util import get_config
 from drakcore.analysis import AnalysisProxy
+from drakcore.database import Database
 
 
 app = Flask(__name__, static_folder='frontend/build/static')
-conf = Config(find_config())
+conf = get_config()
 
 rs = SystemService(conf).rs
 minio = SystemService(conf).minio
+db = Database(conf.config["drakmon"].get("database", "sqlite:///var/lib/drakcore/drakcore.db"),
+              pathlib.Path(__file__).parent / "migrations")
+
+
+@app.before_first_request
+def update_metadata_cache():
+    """ Scans whole MinIO bucket and fetch missing metadata files """
+    for analysis in AnalysisProxy(minio, None).enumerate():
+        try:
+            get_analysis_metadata(analysis.uid)
+        except NoSuchKey:
+            # Well, we tried. Too bad
+            pass
 
 
 @app.errorhandler(NoSuchKey)
@@ -79,18 +94,28 @@ def upload():
     return jsonify({"task_uid": task.uid})
 
 
+def get_analysis_metadata(analysis_uid):
+    db_result = db.select_metadata_by_uid(analysis_uid)
+    if db_result is not None:
+        return db_result
+
+    # Cache miss, have to ask MinIO
+    analysis = AnalysisProxy(minio, analysis_uid)
+    metadata = analysis.get_metadata()
+
+    try:
+        db.insert_metadata(analysis_uid, metadata)
+    except Exception:
+        app.logger.exception("Failed to insert %s metadata", analysis_uid)
+
+    return metadata
+
+
 @app.route("/list")
 def route_list():
-    analyses = []
-    for analysis in AnalysisProxy(minio, None).enumerate():
-        try:
-            analyses.append({"id": analysis.uid, "meta": analysis.get_metadata()})
-        except NoSuchKey:
-            continue
-
-    def sorting_key(o):
-        return o.get('meta', {}).get('time_finished', -1)
-    return jsonify(sorted(analyses, key=sorting_key, reverse=True))
+    limit = int(request.args.get("limit", 100))
+    offset = int(request.args.get("offset", 0))
+    return jsonify(list(db.get_latest_metadata(limit, offset)))
 
 
 @app.route("/processed/<task_uid>/<which>")
@@ -153,8 +178,7 @@ def graph(task_uid):
 
 @app.route("/metadata/<task_uid>")
 def metadata(task_uid):
-    analysis = AnalysisProxy(minio, task_uid)
-    return jsonify(analysis.get_metadata())
+    return jsonify(get_analysis_metadata(task_uid))
 
 
 @app.route("/status/<task_uid>")
@@ -163,7 +187,10 @@ def status(task_uid):
     res = {"status": "done"}
 
     for task_key in tasks:
-        task = json.loads(rs.get(task_key))
+        data = rs.get(task_key)
+        if not data:
+            continue
+        task = json.loads(data)
 
         if task["root_uid"] == task_uid:
             if task["status"] != "Finished":

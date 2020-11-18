@@ -5,22 +5,31 @@ import shlex
 import os
 import re
 import json
+import time
 import random
 import subprocess
 import string
 import tempfile
 from shutil import copyfile
+from typing import Optional
 
 import click
 import requests
 from requests import RequestException
 from drakrun.drakpdb import fetch_pdb, make_pdb_profile, dll_file_list, pdb_guid
-from drakrun.config import ETC_DIR, LIB_DIR, InstallInfo
+from drakrun.config import InstallInfo, LIB_DIR, VOLUME_DIR, PROFILE_DIR, ETC_DIR, VM_CONFIG_DIR
+from drakrun.networking import setup_vm_network, start_dnsmasq
 from drakrun.storage import get_storage_backend, REGISTERED_BACKEND_NAMES
+from drakrun.vmconf import generate_vm_conf
+from drakrun.util import RuntimeInfo, VmiOffsets
+from tqdm import tqdm
 
 logging.basicConfig(level=logging.DEBUG,
                     format='[%(asctime)s][%(levelname)s] %(message)s',
                     handlers=[logging.StreamHandler()])
+
+conf = configparser.ConfigParser()
+conf.read(os.path.join(ETC_DIR, "config.ini"))
 
 
 def find_default_interface():
@@ -38,17 +47,12 @@ def find_default_interface():
 
 def detect_defaults():
     os.makedirs(ETC_DIR, exist_ok=True)
-    os.makedirs(os.path.join(ETC_DIR, "configs"), exist_ok=True)
+    os.makedirs(VM_CONFIG_DIR, exist_ok=True)
 
     os.makedirs(LIB_DIR, exist_ok=True)
-    os.makedirs(os.path.join(LIB_DIR, "profiles"), exist_ok=True)
-    os.makedirs(os.path.join(LIB_DIR, "volumes"), exist_ok=True)
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    os.makedirs(VOLUME_DIR, exist_ok=True)
 
-    conf = configparser.ConfigParser()
-    conf.read(os.path.join(ETC_DIR, "config.ini"))
-    conf_patched = False
-
-    minio_access_key = conf.get('minio', 'access_key')
     out_interface = conf.get('drakrun', 'out_interface')
 
     if not out_interface:
@@ -57,23 +61,8 @@ def detect_defaults():
         if default_if:
             logging.info(f"Detected default network interface: {default_if}")
             conf['drakrun']['out_interface'] = default_if
-            conf_patched = True
         else:
             logging.warning("Unable to detect default network interface.")
-
-    if os.path.exists("/etc/drakcore/config.ini"):
-        if not minio_access_key:
-            logging.info("Detected single-node setup, copying minio and redis sections from /etc/drakcore/config.ini")
-            core_conf = configparser.ConfigParser()
-            core_conf.read("/etc/drakcore/config.ini")
-
-            conf['redis'] = core_conf['redis']
-            conf['minio'] = core_conf['minio']
-            conf_patched = True
-
-    if conf_patched:
-        with open(os.path.join(ETC_DIR, "config.ini"), "w") as f:
-            conf.write(f)
 
 
 def ensure_zfs(ctx, param, value):
@@ -97,15 +86,10 @@ def ensure_zfs(ctx, param, value):
 @click.option('--zfs-tank-name', 'zfs_tank_name',
               callback=ensure_zfs,
               help='Tank name (only for ZFS storage backend)')
-@click.option('--max-vms', 'max_vms',
-              type=int,
-              default=1,
-              show_default=True,
-              help='Maximum number of simultaneous VMs')
 @click.option('--unattended-xml', 'unattended_xml',
               type=click.Path(exists=True),
               help='Path to autounattend.xml for automated Windows install')
-def install(storage_backend, disk_size, iso_path, zfs_tank_name, max_vms, unattended_xml):
+def install(storage_backend, disk_size, iso_path, zfs_tank_name, unattended_xml):
     logging.info("Ensuring that drakrun@* services are stopped...")
     subprocess.check_output('systemctl stop \'drakrun@*\'', shell=True, stderr=subprocess.STDOUT)
 
@@ -121,7 +105,7 @@ def install(storage_backend, disk_size, iso_path, zfs_tank_name, max_vms, unatte
                     fw.write(fr.read())
 
             try:
-                subprocess.check_output(['genisoimage', '-o', os.path.join(LIB_DIR, "volumes/unattended.iso"), '-J', '-r', tmp_xml_path], stderr=subprocess.STDOUT)
+                subprocess.check_output(['genisoimage', '-o', os.path.join(VOLUME_DIR, "unattended.iso"), '-J', '-r', tmp_xml_path], stderr=subprocess.STDOUT)
             except subprocess.CalledProcessError:
                 logging.exception("Failed to generate unattended.iso.")
 
@@ -138,7 +122,6 @@ def install(storage_backend, disk_size, iso_path, zfs_tank_name, max_vms, unatte
         disk_size=disk_size,
         iso_path=os.path.abspath(iso_path),
         zfs_tank_name=zfs_tank_name,
-        max_vms=max_vms,
         enable_unattended=unattended_xml is not None,
         iso_sha256=iso_sha256
     )
@@ -178,15 +161,16 @@ def install(storage_backend, disk_size, iso_path, zfs_tank_name, max_vms, unatte
         logging.exception("Failed to execute brctl show. Make sure you have bridge-utils installed.")
         return
 
-    try:
-        subprocess.check_output('brctl addbr drak0', stderr=subprocess.STDOUT, shell=True)
-    except subprocess.CalledProcessError as e:
-        if b'already exists' in e.output:
-            logging.info("Bridge drak0 already exists.")
-        else:
-            logging.exception("Failed to create bridge drak0.")
+    net_enable = int(conf['drakrun'].get('net_enable', '0'))
+    out_interface = conf['drakrun'].get('out_interface', '')
+    dns_server = conf['drakrun'].get('dns_server', '')
 
-    cfg_path = os.path.join(ETC_DIR, "configs/vm-0.cfg")
+    setup_vm_network(vm_id=0, net_enable=net_enable, out_interface=out_interface, dns_server=dns_server)
+
+    if net_enable:
+        start_dnsmasq(vm_id=0, dns_server=dns_server, background=True)
+
+    cfg_path = os.path.join(VM_CONFIG_DIR, "vm-0.cfg")
 
     try:
         subprocess.run('xl create {}'.format(shlex.quote(cfg_path)), shell=True, check=True)
@@ -235,19 +219,18 @@ def create_rekall_profiles(install_info: InstallInfo):
         except subprocess.CalledProcessError:
             raise RuntimeError(f"Failed to mount {block_device} as NTFS.")
 
-        profiles_path = os.path.join(LIB_DIR, "profiles")
         for file in dll_file_list:
             try:
                 logging.info(f"Fetching rekall profile for {file.path}")
-                local_dll_path = os.path.join(profiles_path, file.dest)
+                local_dll_path = os.path.join(PROFILE_DIR, file.dest)
 
                 copyfile(os.path.join(mount_path, file.path), local_dll_path)
                 guid = pdb_guid(local_dll_path)
-                tmp = fetch_pdb(guid["filename"], guid["GUID"], profiles_path)
+                tmp = fetch_pdb(guid["filename"], guid["GUID"], PROFILE_DIR)
 
                 logging.debug("Parsing PDB into JSON profile...")
                 profile = make_pdb_profile(tmp)
-                with open(os.path.join(profiles_path, f"{file.dest}.json"), 'w') as f:
+                with open(os.path.join(PROFILE_DIR, f"{file.dest}.json"), 'w') as f:
                     f.write(profile)
             except FileNotFoundError:
                 logging.warning(f"Failed to copy file {file.path}, skipping...")
@@ -258,11 +241,64 @@ def create_rekall_profiles(install_info: InstallInfo):
             finally:
                 if os.path.exists(local_dll_path):
                     os.remove(local_dll_path)
-                if os.path.exists(os.path.join(profiles_path, tmp)):
-                    os.remove(os.path.join(profiles_path, tmp))
+                if os.path.exists(os.path.join(PROFILE_DIR, tmp)):
+                    os.remove(os.path.join(PROFILE_DIR, tmp))
 
         # cleanup
         subprocess.check_output(f'umount {mnt_path_quoted}', shell=True)
+
+
+def extract_explorer_pid(
+    domain: str,
+    kernel_profile: str,
+    offsets: VmiOffsets,
+    timeout: int = 30
+) -> Optional[int]:
+    """ Call get-explorer-pid helper and get its PID """
+    module_dir = os.path.dirname(os.path.realpath(__file__))
+    pid_tool = os.path.join(module_dir, "tools", "get-explorer-pid")
+    try:
+        explorer_pid_s = subprocess.check_output([
+            pid_tool,
+            domain,
+            kernel_profile,
+            hex(offsets.kpgd)
+        ], timeout=timeout).decode('utf-8', 'ignore')
+
+        m = re.search(r'explorer\.exe:([0-9]+)', explorer_pid_s)
+        if m is not None:
+            return int(m.group(1))
+
+    except subprocess.CalledProcessError:
+        logging.exception("get-explorer-pid exited with an error")
+    except subprocess.TimeoutExpired:
+        logging.exception("get-explorer-pid timed out")
+
+    raise RuntimeError("Extracting explorer PID failed")
+
+
+def extract_vmi_offsets(
+    domain: str,
+    kernel_profile: str,
+    timeout: int = 30
+) -> Optional[VmiOffsets]:
+    """ Call vmi-win-offsets helper and obtain VmiOffsets values """
+    try:
+        output = subprocess.check_output([
+            'vmi-win-offsets',
+            '--name', domain,
+            '--json-kernel', kernel_profile
+        ], timeout=timeout).decode('utf-8', 'ignore')
+
+        return VmiOffsets.from_tool_output(output)
+    except TypeError:
+        logging.exception("Invalid output of vmi-win-offsets")
+    except subprocess.CalledProcessError:
+        logging.exception("vmi-win-offsets exited with an error")
+    except subprocess.TimeoutExpired:
+        logging.exception("vmi-win-offsets timed out")
+
+    raise RuntimeError("Extracting VMI offsets failed")
 
 
 @click.command()
@@ -279,7 +315,6 @@ def postinstall(report, generate_usermode):
         report = False
 
     install_info = InstallInfo.load()
-    max_vms = install_info.max_vms
     output = subprocess.check_output(['vmi-win-guid', 'name', 'vm-0'], timeout=30).decode('utf-8')
 
     try:
@@ -294,43 +329,26 @@ def postinstall(report, generate_usermode):
     logging.info("Determined kernel filename: {}".format(fn))
 
     logging.info("Fetching PDB file...")
-    dest = fetch_pdb(fn, pdb, destdir=os.path.join(LIB_DIR, 'profiles/'))
+    dest = fetch_pdb(fn, pdb, destdir=PROFILE_DIR)
 
     logging.info("Generating profile out of PDB file...")
     profile = make_pdb_profile(dest)
 
     logging.info("Saving profile...")
-    kernel_profile = os.path.join(LIB_DIR, 'profiles', 'kernel.json')
+    kernel_profile = os.path.join(PROFILE_DIR, 'kernel.json')
     with open(kernel_profile, 'w') as f:
         f.write(profile)
 
-    output = subprocess.check_output(['vmi-win-offsets', '--name', 'vm-0', '--json-kernel', kernel_profile], timeout=30).decode('utf-8')
-
-    offsets = re.findall(r'^([a-z_]+):(0x[0-9a-f]+)$', output, re.MULTILINE)
-    if not offsets:
-        logging.error("Failed to parse output of vmi-win-offsets.")
-        return
-
-    offsets_dict = {k: v for k, v in offsets}
-
-    if 'kpgd' not in offsets_dict:
-        logging.error("Failed to obtain KPGD value.")
-        return
-
-    module_dir = os.path.dirname(os.path.realpath(__file__))
-    pid_tool = os.path.join(module_dir, "tools", "get-explorer-pid")
-    explorer_pid_s = subprocess.check_output([pid_tool, "vm-0", kernel_profile, offsets_dict['kpgd']], timeout=30).decode('ascii', 'ignore')
-    m = re.search(r'explorer\.exe:([0-9]+)', explorer_pid_s)
-    explorer_pid = m.group(1)
-
-    runtime_profile = {"vmi_offsets": offsets_dict, "inject_pid": explorer_pid}
+    vmi_offsets = extract_vmi_offsets('vm-0', kernel_profile)
+    explorer_pid = extract_explorer_pid('vm-0', kernel_profile, vmi_offsets)
+    runtime_info = RuntimeInfo(vmi_offsets=vmi_offsets, inject_pid=explorer_pid)
 
     logging.info("Saving runtime profile...")
-    with open(os.path.join(LIB_DIR, 'profiles', 'runtime.json'), 'w') as f:
-        f.write(json.dumps(runtime_profile, indent=4))
+    with open(os.path.join(PROFILE_DIR, 'runtime.json'), 'w') as f:
+        f.write(runtime_info.to_json(indent=4))
 
     logging.info("Saving VM snapshot...")
-    subprocess.check_output('xl save vm-0 ' + os.path.join(LIB_DIR, "volumes", "snapshot.sav"), shell=True)
+    subprocess.check_output('xl save vm-0 ' + os.path.join(VOLUME_DIR, "snapshot.sav"), shell=True)
 
     storage_backend = get_storage_backend(install_info)
     storage_backend.snapshot_vm0_volume()
@@ -342,10 +360,6 @@ def postinstall(report, generate_usermode):
         except RuntimeError as e:
             logging.warning("Generating usermode profiles failed")
             logging.exception(e)
-
-    for vm_id in range(max_vms + 1):
-        # we treat vm_id=0 as special internal one
-        generate_vm_conf(install_info, vm_id)
 
     if report:
         send_usage_report({
@@ -359,58 +373,17 @@ def postinstall(report, generate_usermode):
             }
         })
 
-    reenable_services()
     logging.info("All right, drakrun setup is done.")
+    logging.info("First instance of drakrun will be enabled automatically...")
+    subprocess.check_output('systemctl enable drakrun@1', shell=True)
+    subprocess.check_output('systemctl start drakrun@1', shell=True)
 
-
-def reenable_services():
-    install_info = InstallInfo.try_load()
-    if not install_info:
-        logging.info("Not re-enabling services, install.json is missing.")
-        return
-
-    subprocess.check_output('systemctl disable \'drakrun@*\'', shell=True, stderr=subprocess.STDOUT)
-    subprocess.check_output('systemctl stop \'drakrun@*\'', shell=True, stderr=subprocess.STDOUT)
-
-    for vm_id in range(1, install_info.max_vms + 1):
-        logging.info("Enabling and starting drakrun@{0}...".format(vm_id))
-        subprocess.check_output('systemctl enable drakrun@{0}'.format(vm_id), shell=True, stderr=subprocess.STDOUT)
-        subprocess.check_output('systemctl restart drakrun@{0}'.format(vm_id), shell=True, stderr=subprocess.STDOUT)
-
-
-def generate_vm_conf(install_info: InstallInfo, vm_id: int):
-    with open(os.path.join(ETC_DIR, 'scripts/cfg.template'), 'r') as f:
-        template = f.read()
-
-    storage_backend = get_storage_backend(install_info)
-
-    disks = []
-    disks.append(storage_backend.get_vm_disk_path(vm_id))
-
-    disks.append('file:{iso},hdc:cdrom,r'.format(iso=os.path.abspath(install_info.iso_path)))
-
-    if install_info.enable_unattended:
-        disks.append('file:{main_dir}/volumes/unattended.iso,hdd:cdrom,r'.format(main_dir=LIB_DIR))
-
-    disks = ', '.join(['"{}"'.format(disk) for disk in disks])
-
-    template = template.replace('{{ VM_ID }}', str(vm_id))
-    template = template.replace('{{ DISKS }}', disks)
-    template = template.replace('{{ VNC_PORT }}', str(6400 + vm_id))
-
-    if vm_id == 0:
-        template = re.sub('on_reboot[ ]*=(.*)', 'on_reboot = "restart"', template)
-
-    with open(os.path.join(ETC_DIR, 'configs/vm-{}.cfg'.format(vm_id)), 'w') as f:
-        f.write(template)
-
-    logging.info("Generated VM configuration for vm-{vm_id}".format(vm_id=vm_id))
+    logging.info("If you want to have more parallel instances, execute:")
+    logging.info("  # draksetup scale <number of instances>")
 
 
 @click.command(help='Perform tasks after drakrun upgrade')
 def postupgrade():
-    reenable_services()
-
     with open(os.path.join(ETC_DIR, 'scripts/cfg.template'), 'r') as f:
         template = f.read()
 
@@ -418,10 +391,60 @@ def postupgrade():
     passwd = ''.join(random.choice(passwd_characters) for i in range(20))
     template = template.replace('{{ VNC_PASS }}', passwd)
 
-    with open(os.path.join(ETC_DIR, 'scripts/cfg.template'), 'w') as f:
+    with open(os.path.join(ETC_DIR, 'scripts', 'cfg.template'), 'w') as f:
         f.write(template)
 
     detect_defaults()
+
+
+def get_enabled_drakruns():
+    for fn in os.listdir("/etc/systemd/system/default.target.wants"):
+        if re.fullmatch('drakrun@[0-9]+\\.service', fn):
+            yield fn
+
+
+def wait_processes(descr, popens):
+    total = len(popens)
+
+    if total == 0:
+        return True
+
+    exit_codes = []
+
+    with tqdm(total=total, unit_scale=True) as pbar:
+        pbar.set_description(descr)
+        while True:
+            time.sleep(0.25)
+            for popen in popens:
+                exit_code = popen.poll()
+                if exit_code is not None:
+                    exit_codes.append(exit_code)
+                    popens.remove(popen)
+                    pbar.update(1)
+
+            if len(popens) == 0:
+                return all([exit_code == 0 for exit_code in exit_codes])
+
+
+@click.command(help='Scale drakrun services',
+               no_args_is_help=True)
+@click.argument('scale_count',
+                type=int)
+def scale(scale_count):
+    """Enable or disable additional parallel instances of drakrun service.."""
+    if scale_count < 1:
+        raise RuntimeError('Invalid value of scale parameter. Must be at least 1.')
+
+    cur_services = set(list(get_enabled_drakruns()))
+    new_services = set([f'drakrun@{i}.service' for i in range(1, scale_count + 1)])
+
+    disable_services = cur_services - new_services
+    enable_services = new_services
+
+    wait_processes('disable services', [subprocess.Popen(["systemctl", "disable", service], stdout=subprocess.PIPE, stderr=subprocess.PIPE) for service in disable_services])
+    wait_processes('enable services', [subprocess.Popen(["systemctl", "enable", service], stdout=subprocess.PIPE, stderr=subprocess.PIPE) for service in enable_services])
+    wait_processes('start services', [subprocess.Popen(["systemctl", "start", service], stdout=subprocess.PIPE, stderr=subprocess.PIPE) for service in enable_services])
+    wait_processes('stop services', [subprocess.Popen(["systemctl", "stop", service], stdout=subprocess.PIPE, stderr=subprocess.PIPE) for service in disable_services])
 
 
 @click.command(help='Mount ISO into guest',
@@ -450,6 +473,7 @@ main.add_command(install)
 main.add_command(postinstall)
 main.add_command(postupgrade)
 main.add_command(mount)
+main.add_command(scale)
 
 
 if __name__ == "__main__":

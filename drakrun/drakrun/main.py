@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import logging
+import sys
 import os
 import shutil
 import argparse
@@ -12,8 +13,10 @@ import zipfile
 import json
 import re
 import functools
+from collections import Counter
 from io import StringIO
-from typing import Optional, List
+from typing import Optional, List, Dict
+from pathlib import Path
 from stat import S_ISREG, ST_CTIME, ST_MODE, ST_SIZE
 from configparser import NoOptionError
 
@@ -24,62 +27,12 @@ from karton2 import Karton, Config, Task, LocalResource
 
 import drakrun.office as d_office
 from drakrun.drakpdb import dll_file_list
-from drakrun.drakparse import parse_logs
-from drakrun.config import ETC_DIR, LIB_DIR, InstallInfo
+from drakrun.config import InstallInfo, ETC_DIR, VM_CONFIG_DIR, VOLUME_DIR, PROFILE_DIR
 from drakrun.storage import get_storage_backend
-
-INSTANCE_ID = None
-PROFILE_DIR = os.path.join(LIB_DIR, "profiles")
-
-
-def get_domid_from_instance_id(instance_id: str) -> int:
-    output = subprocess.check_output(["xl", "domid", f"vm-{instance_id}"])
-    return int(output.decode('utf-8').strip())
-
-
-def start_tcpdump_collector(instance_id: str, outdir: str) -> Optional[subprocess.Popen]:
-    domid = get_domid_from_instance_id(instance_id)
-
-    try:
-        subprocess.check_output("tcpdump --version", shell=True)
-    except subprocess.CalledProcessError:
-        logging.warning("Seems like tcpdump is not working/not installed on your system. Pcap will not be recorded.")
-        return None
-
-    return subprocess.Popen([
-        "tcpdump",
-        "-i",
-        f"vif{domid}.0-emu",
-        "-w",
-        f"{outdir}/dump.pcap"
-    ])
-
-
-def start_dnsmasq(vm_id: int, dns_server: str) -> Optional[subprocess.Popen]:
-    try:
-        subprocess.check_output("dnsmasq --version", shell=True)
-    except subprocess.CalledProcessError:
-        logging.warning("Seems like dnsmasq is not working/not installed on your system."
-                        "Guest networking may not be fully functional.")
-        return None
-
-    if dns_server == "use-gateway-address":
-        dns_server = f"10.13.{vm_id}.1"
-
-    return subprocess.Popen([
-        "dnsmasq",
-        "--no-daemon",
-        "--conf-file=/dev/null",
-        "--bind-interfaces",
-        f"--interface=drak{vm_id}",
-        "--port=0",
-        "--no-hosts",
-        "--no-resolv",
-        "--no-poll",
-        "--leasefile-ro",
-        f"--dhcp-range=10.13.{vm_id}.100,10.13.{vm_id}.200,255.255.255.0,12h",
-        f"--dhcp-option=option:dns-server,{dns_server}"
-    ])
+from drakrun.networking import start_tcpdump_collector, start_dnsmasq, setup_vm_network
+from drakrun.util import patch_config, get_domid_from_instance_id, get_xl_info, get_xen_commandline, RuntimeInfo
+from drakrun.vmconf import generate_vm_conf
+from drakrun.injector import Injector
 
 
 class LocalLogBuffer(logging.Handler):
@@ -133,10 +86,9 @@ def with_logs(object_name):
 
 
 class DrakrunKarton(Karton):
-    # this might be changed by initialization
-    # if different identity name is specified in config
-    identity = "karton.drakrun-prod"
-    filters = [
+    # Karton configuration defaults, may be overriden by config file
+    DEFAULT_IDENTITY = "karton.drakrun-prod"
+    DEFAULT_FILTERS = [
         {
             "type": "sample",
             "stage": "recognized",
@@ -148,51 +100,47 @@ class DrakrunKarton(Karton):
             "platform": "win64"
         }
     ]
+    DEFAULT_HEADERS = {
+        "type": "analysis",
+        "kind": "drakrun",
+    }
 
-    @staticmethod
-    def _add_iptable_rule(rule):
-        try:
-            subprocess.check_output(f"iptables -C {rule}", shell=True)
-        except subprocess.CalledProcessError as e:
-            if e.returncode == 1:
-                # rule doesn't exist
-                subprocess.check_output(f"iptables -A {rule}", shell=True)
-            else:
-                # some other error
-                raise RuntimeError(f'Failed to check for iptables rule: {rule}')
+    def __init__(self, config: Config, instance_id: int):
+        super().__init__(config)
+        self.instance_id = instance_id
+        self.install_info = InstallInfo.load()
+        self.default_timeout = int(self.config.config['drakrun'].get('analysis_timeout') or 60 * 10)
+        with open(os.path.join(PROFILE_DIR, "runtime.json"), 'r') as runtime_f:
+            self.runtime_info = RuntimeInfo.load(runtime_f)
+
+    @classmethod
+    def reconfigure(cls, config: Dict[str, str]):
+        """ Reconfigure DrakrunKarton class """
+        def load_json(config, key):
+            try:
+                return json.loads(config.get(key)) if key in config else None
+            except json.JSONDecodeError:
+                raise RuntimeError(f"Key '{key}' in section [drakrun] is not valid JSON")
+
+        cls.identity = config.get('identity', cls.DEFAULT_IDENTITY)
+        cls.filters = load_json(config, 'filters') or cls.DEFAULT_FILTERS
+        cls.headers = load_json(config, 'headers') or cls.DEFAULT_HEADERS
+
+    @property
+    def vm_name(self) -> str:
+        return f"vm-{self.instance_id}"
 
     def init_drakrun(self):
+        generate_vm_conf(self.install_info, self.instance_id)
+
         if not self.minio.bucket_exists('drakrun'):
             self.minio.make_bucket(bucket_name='drakrun')
-
-        try:
-            subprocess.check_output(f'brctl addbr drak{INSTANCE_ID}', stderr=subprocess.STDOUT, shell=True)
-        except subprocess.CalledProcessError as e:
-            if b'already exists' in e.output:
-                logging.info(f"Bridge drak{INSTANCE_ID} already exists.")
-            else:
-                logging.exception(f"Failed to create bridge drak{INSTANCE_ID}.")
-        else:
-            subprocess.check_output(f'ip addr add 10.13.{INSTANCE_ID}.1/24 dev drak{INSTANCE_ID}', shell=True)
-
-        subprocess.check_output(f'ip link set dev drak{INSTANCE_ID} up', shell=True)
-        self._add_iptable_rule(f"INPUT -i drak{INSTANCE_ID} -p udp --dport 67:68 --sport 67:68 -j ACCEPT")
-        self._add_iptable_rule(f"INPUT -i drak{INSTANCE_ID} -d 0.0.0.0/0 -j DROP")
 
         net_enable = int(self.config.config['drakrun'].get('net_enable', '0'))
         out_interface = self.config.config['drakrun'].get('out_interface', '')
         dns_server = self.config.config['drakrun'].get('dns_server', '')
 
-        if dns_server == "use-gateway-address":
-            self._add_iptable_rule(f"INPUT -i drak{INSTANCE_ID} -p udp --dport 52 --sport 52 -j ACCEPT")
-
-        if net_enable:
-            with open('/proc/sys/net/ipv4/ip_forward', 'w') as f:
-                f.write('1\n')
-
-            self._add_iptable_rule(f"POSTROUTING -t nat -s 10.13.{INSTANCE_ID}.0/24 -o {out_interface} -j MASQUERADE")
-            self._add_iptable_rule(f"FORWARD -i drak{INSTANCE_ID} -o {out_interface} -j ACCEPT")
-            self._add_iptable_rule(f"FORWARD -i {out_interface} -o drak{INSTANCE_ID} -j ACCEPT")
+        setup_vm_network(self.instance_id, net_enable, out_interface, dns_server)
 
     @staticmethod
     def _get_dll_run_command(pe_data):
@@ -207,22 +155,22 @@ class DrakrunKarton(Karton):
 
         for export in exports:
             if export[1] == 'DllRegisterServer':
-                return 'start regsvr32 %f'
+                return 'regsvr32 %f'
 
             if 'DllMain' in export[1]:
-                return 'start rundll32 %f,{}'.format(export[1])
+                return 'rundll32 %f,{}'.format(export[1])
 
         if exports:
             if exports[0][1]:
-                return 'start rundll32 %f,{}'.format(export[1].split('@')[0])
+                return 'rundll32 %f,{}'.format(export[1].split('@')[0])
             elif exports[0][0]:
-                return 'start rundll32 %f,#{}'.format(export[0])
+                return 'rundll32 %f,#{}'.format(export[0])
 
         return None
 
     @staticmethod
     def _get_office_file_run_command(extension, file_path):
-        start_command = ['start']
+        start_command = ['cmd.exe', '/C', 'start']
         if d_office.is_office_word_file(extension):
             start_command.append('winword.exe')
         else:
@@ -241,9 +189,11 @@ class DrakrunKarton(Karton):
         if extension == 'dll':
             start_command = self.current_task.payload.get("start_command", self._get_dll_run_command(sample.content))
         elif extension == 'exe':
-            start_command = 'start %f'
+            start_command = '%f'
         elif d_office.is_office_file(extension):
             start_command = self._get_office_file_run_command(extension, file_path)
+        elif extension == 'ps1':
+            start_command = 'powershell.exe -executionpolicy bypass -File %f'
         else:
             self.log.error("Unknown file extension - %s", extension)
             start_command = None
@@ -272,54 +222,12 @@ class DrakrunKarton(Karton):
         if current_size > max_total_size:
             self.log.error('Some dumps were deleted, because the configured size threshold was exceeded.')
 
-    def generate_graphs(self, workdir):
-        with open(os.path.join(workdir, 'drakmon.log'), 'r') as f:
-            with open(os.path.join(workdir, 'drakmon.csv'), 'w') as o:
-                for csv_line in parse_logs(f):
-                    if csv_line.strip():
-                        o.write(csv_line.strip() + "\n")
-                    else:
-                        print('empty line?')
+    def compress_ipt(self, dirpath, target_zip):
+        zipf = zipfile.ZipFile(target_zip, 'w', zipfile.ZIP_DEFLATED)
 
-        try:
-            subprocess.run(['/opt/procdot/procmon2dot', os.path.join(workdir, 'drakmon.csv'), os.path.join(workdir, 'graph.dot'), 'procdot,forceascii'], cwd=workdir, check=True)
-        except subprocess.CalledProcessError:
-            self.log.exception("Failed to generate graph using procdot")
-
-        os.unlink(os.path.join(workdir, 'drakmon.csv'))
-
-    def slice_logs(self, workdir):
-        plugin_fd = {}
-
-        with open(os.path.join(workdir, 'drakmon.log'), 'rb') as f:
-            while True:
-                line = f.readline()
-
-                if not line:
-                    break
-
-                try:
-                    line_s = line.strip().decode('utf-8')
-                    obj = json.loads(line_s)
-                except UnicodeDecodeError:
-                    self.log.exception("BUG: Failed to decode UTF-8 from drakmon.log line: {}".format(line))
-                except json.JSONDecodeError:
-                    self.log.exception("BUG: Failed to JSON parse drakmon.log line: {}".format(line))
-
-                if 'Plugin' not in obj:
-                    obj['Plugin'] = 'unknown'
-
-                if obj['Plugin'] not in plugin_fd:
-                    plugin_fd[obj['Plugin']] = open(os.path.join(workdir, obj['Plugin'] + '.log'), 'w')
-                else:
-                    plugin_fd[obj['Plugin']].write('\n')
-
-                plugin_fd[obj['Plugin']].write(json.dumps(obj))
-
-        for fd in plugin_fd.values():
-            fd.close()
-
-        os.unlink(os.path.join(workdir, 'drakmon.log'))
+        for root, dirs, files in os.walk(dirpath):
+            for file in files:
+                zipf.write(os.path.join(root, file), os.path.join("ipt", os.path.relpath(os.path.join(root, file), dirpath)))
 
     def upload_artifacts(self, analysis_uid, workdir, subdir=''):
         base_path = os.path.join(workdir, 'output')
@@ -348,27 +256,24 @@ class DrakrunKarton(Karton):
 
         return out
 
-    @staticmethod
-    def run_vm(vm_id):
-        install_info = InstallInfo.load()
-
+    def run_vm(self):
         try:
-            subprocess.check_output(["xl", "destroy", "vm-{vm_id}".format(vm_id=vm_id)], stderr=subprocess.STDOUT)
+            subprocess.check_output(["xl", "destroy", self.vm_name], stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError:
             pass
 
-        storage_backend = get_storage_backend(install_info)
+        storage_backend = get_storage_backend(self.install_info)
         snapshot_version = storage_backend.get_vm0_snapshot_time()
-        storage_backend.rollback_vm_storage(vm_id)
+        storage_backend.rollback_vm_storage(self.instance_id)
 
         try:
             subprocess.run(["xl", "-vvv", "restore",
-                            os.path.join(ETC_DIR, "configs/vm-{vm_id}.cfg".format(vm_id=vm_id)),
-                            os.path.join(LIB_DIR, "volumes/snapshot.sav")], check=True)
+                            os.path.join(VM_CONFIG_DIR, f"{self.vm_name}.cfg"),
+                            os.path.join(VOLUME_DIR, "snapshot.sav")], check=True)
         except subprocess.CalledProcessError:
-            logging.exception("Failed to restore VM {vm_id}".format(vm_id=vm_id))
+            logging.exception(f"Failed to restore VM {self.vm_name}")
 
-            with open("/var/log/xen/qemu-dm-vm-{vm_id}.log".format(vm_id=vm_id), "rb") as f:
+            with open(f"/var/log/xen/qemu-dm-{self.vm_name}.log", "rb") as f:
                 logging.error(f.read())
 
         return snapshot_version
@@ -381,7 +286,7 @@ class DrakrunKarton(Karton):
         magic_output = magic.from_buffer(sample.content)
         self.log.info("running sample sha256: {}".format(sha256sum))
 
-        timeout = self.current_task.payload.get('timeout') or 60 * 10
+        timeout = self.current_task.payload.get('timeout') or self.default_timeout
         hard_time_limit = 60 * 20
         if timeout > hard_time_limit:
             self.log.error("Tried to run the analysis for more than hard limit of %d seconds", hard_time_limit)
@@ -397,9 +302,9 @@ class DrakrunKarton(Karton):
             self.log.info(f"override UID: {override_uid}")
             self.log.info("note that artifacts will be stored under this overriden identifier")
 
-        self.rs.set(f"drakvnc:{analysis_uid}", INSTANCE_ID, ex=3600)  # 1h
+        self.rs.set(f"drakvnc:{analysis_uid}", self.instance_id, ex=3600)  # 1h
 
-        workdir = '/tmp/drakrun/vm-{}'.format(int(INSTANCE_ID))
+        workdir = f"/tmp/drakrun/{self.vm_name}"
 
         extension = self.current_task.headers.get("extension", "exe").lower()
         if '(DLL)' in magic_output:
@@ -430,6 +335,7 @@ class DrakrunKarton(Karton):
         outdir = os.path.join(workdir, 'output')
         os.mkdir(outdir)
         os.mkdir(os.path.join(outdir, 'dumps'))
+        os.mkdir(os.path.join(outdir, 'ipt'))
 
         metadata = {
             "sample_sha256": sha256sum,
@@ -445,45 +351,30 @@ class DrakrunKarton(Karton):
 
         for _ in range(3):
             try:
-                self.log.info("running vm {}".format(INSTANCE_ID))
-                watcher_dnsmasq = start_dnsmasq(INSTANCE_ID, self.config.config['drakrun'].get('dns_server', '8.8.8.8'))
+                self.log.info("Running VM {}".format(self.instance_id))
+                watcher_dnsmasq = start_dnsmasq(self.instance_id, self.config.config['drakrun'].get('dns_server', '8.8.8.8'))
 
-                snapshot_version = self.run_vm(INSTANCE_ID)
+                snapshot_version = self.run_vm()
                 metadata['snapshot_version'] = snapshot_version
 
-                watcher_tcpdump = start_tcpdump_collector(INSTANCE_ID, outdir)
+                watcher_tcpdump = start_tcpdump_collector(self.instance_id, outdir)
 
-                self.log.info("running monitor {}".format(INSTANCE_ID))
-
-                kernel_profile = os.path.join(PROFILE_DIR, "kernel.json")
-                runtime_profile = os.path.join(PROFILE_DIR, "runtime.json")
-                with open(runtime_profile, 'r') as runtime_f:
-                    rp = json.loads(runtime_f.read())
-                    inject_pid = rp['inject_pid']
-                    kpgd = rp['vmi_offsets']['kpgd']
+                self.log.info("running monitor {}".format(self.instance_id))
 
                 hooks_list = os.path.join(ETC_DIR, "hooks.txt")
+                kernel_profile = os.path.join(PROFILE_DIR, "kernel.json")
                 dump_dir = os.path.join(outdir, "dumps")
+                ipt_dir = os.path.join(outdir, "ipt")
                 drakmon_log_fp = os.path.join(outdir, "drakmon.log")
 
-                injector_cmd = ["injector",
-                                "-o", "json",
-                                "-d", "vm-{vm_id}".format(vm_id=INSTANCE_ID),
-                                "-r", kernel_profile,
-                                "-i", inject_pid,
-                                "-k", kpgd,
-                                "-m", "writefile",
-                                "-e", f"%USERPROFILE%\\Desktop\\{file_name}",
-                                "-B", os.path.join(workdir, file_name)]
+                self.log.info("Copying sample to VM...")
+                injector = Injector(self.vm_name, self.runtime_info, kernel_profile)
+                result = injector.write_file(
+                    os.path.join(workdir, file_name),
+                    f"%USERPROFILE%\\Desktop\\{file_name}"
+                )
 
-                self.log.info("Running injector...")
-                injector = subprocess.Popen(injector_cmd, stdout=subprocess.PIPE)
-                outs, errs = injector.communicate(b"", 20)
-
-                if injector.returncode != 0:
-                    raise subprocess.CalledProcessError(injector.returncode, injector_cmd)
-
-                injected_fn = json.loads(outs)['ProcessName']
+                injected_fn = json.loads(result.stdout)['ProcessName']
                 net_enable = int(self.config.config['drakrun'].get('net_enable', '0'))
 
                 if "%f" not in start_command:
@@ -494,12 +385,12 @@ class DrakrunKarton(Karton):
 
                 # don't include our internal maintanance commands
                 metadata['start_command'] = cur_start_command
-                cur_start_command = f"cd {cwd} & " + cur_start_command
 
                 if net_enable:
-                    cur_start_command = "ipconfig /renew & " + cur_start_command
+                    self.log.info("Setting up network...")
+                    injector.create_process("cmd /C ipconfig /renew >nul", wait=True, timeout=120)
 
-                full_cmd = subprocess.list2cmdline(["cmd.exe", "/C", cur_start_command])
+                full_cmd = cur_start_command
                 self.log.info("Using command: %s", full_cmd)
 
                 drakvuf_cmd = ["drakvuf",
@@ -507,15 +398,21 @@ class DrakrunKarton(Karton):
                                "-x", "poolmon",
                                "-x", "objmon",
                                "-x", "socketmon",
+                               "-x", "dkommon",
+                               "-x", "envmon",
                                "-j", "5",
                                "-t", str(timeout),
-                               "-i", inject_pid,
-                               "-k", kpgd,
-                               "-d", "vm-{vm_id}".format(vm_id=INSTANCE_ID),
+                               "-i", str(self.runtime_info.inject_pid),
+                               "-k", hex(self.runtime_info.vmi_offsets.kpgd),
+                               "-d", self.vm_name,
                                "--dll-hooks-list", hooks_list,
                                "--memdump-dir", dump_dir,
                                "-r", kernel_profile,
-                               "-e", full_cmd]
+                               "-e", full_cmd,
+                               "-c", cwd]
+
+                if self.config.config['drakrun'].getboolean('enable_ipt', fallback=False):
+                    drakvuf_cmd.extend(["--ipt-dir", ipt_dir])
 
                 drakvuf_cmd.extend(self.get_profile_list())
 
@@ -543,12 +440,12 @@ class DrakrunKarton(Karton):
                         raise subprocess.CalledProcessError(exit_code, drakvuf_cmd)
                 break
             except subprocess.CalledProcessError:
-                self.log.info("Something went wrong with the VM {}".format(INSTANCE_ID), exc_info=True)
+                self.log.info("Something went wrong with the VM {}".format(self.instance_id), exc_info=True)
             finally:
                 try:
-                    subprocess.run(["xl", "destroy", "vm-{}".format(INSTANCE_ID)], cwd=workdir, check=True)
+                    subprocess.run(["xl", "destroy", self.vm_name], cwd=workdir, check=True)
                 except subprocess.CalledProcessError:
-                    self.log.info("Failed to destroy VM {}".format(INSTANCE_ID), exc_info=True)
+                    self.log.info("Failed to destroy VM {}".format(self.instance_id), exc_info=True)
 
                 if watcher_dnsmasq:
                     watcher_dnsmasq.terminate()
@@ -565,9 +462,10 @@ class DrakrunKarton(Karton):
                 self.log.exception("tcpdump doesn't exit cleanly after 60s")
 
         self.crop_dumps(os.path.join(outdir, 'dumps'), os.path.join(outdir, 'dumps.zip'))
-        if os.path.exists("/opt/procdot/procmon2dot"):
-            self.generate_graphs(outdir)
-        self.slice_logs(outdir)
+
+        if self.config.config['drakrun'].getboolean('enable_ipt', fallback=False):
+            self.compress_ipt(os.path.join(outdir, 'ipt'), os.path.join(outdir, 'ipt.zip'))
+
         self.log.info("uploading artifacts")
 
         metadata['time_finished'] = int(time.time())
@@ -578,14 +476,10 @@ class DrakrunKarton(Karton):
         payload = {"analysis_uid": analysis_uid}
         payload.update(metadata)
 
-        t = Task(
-            {
-                "type": "analysis",
-                "kind": "drakrun",
-                "quality": self.current_task.headers.get("quality", "high")
-            },
-            payload=payload
-        )
+        headers = dict(self.headers)
+        headers["quality"] = self.current_task.headers.get("quality", "high")
+
+        t = Task(headers, payload=payload)
 
         for resource in self.upload_artifacts(analysis_uid, workdir):
             t.add_payload(resource.name, resource)
@@ -594,33 +488,80 @@ class DrakrunKarton(Karton):
         self.send_task(t)
 
 
+def validate_xen_commandline():
+    required_cmdline = {
+        "sched": "credit",
+        "force-ept": "1",
+        "ept": "pml=0",
+        "hap_1gb": "0",
+        "hap_2mb": "0",
+        "altp2m": "1"
+    }
+
+    parsed_xl_info = get_xl_info()
+    xen_cmdline = get_xen_commandline(parsed_xl_info)
+
+    unrecommended = []
+
+    for k, v in required_cmdline.items():
+        actual_v = xen_cmdline.get(k)
+
+        if actual_v != v:
+            unrecommended.append((k, v, actual_v))
+
+    return unrecommended
+
+
 def cmdline_main():
     parser = argparse.ArgumentParser(description='Kartonized drakrun <3')
     parser.add_argument('instance', type=int, help='Instance identifier')
     args = parser.parse_args()
 
-    global INSTANCE_ID
-    INSTANCE_ID = args.instance
-    main()
+    main(args)
 
 
-def main():
+def main(args):
     conf_path = os.path.join(ETC_DIR, "config.ini")
-    conf = Config(conf_path)
+    conf = patch_config(Config(conf_path))
 
     if not conf.config.get('minio', 'access_key').strip():
         logging.warning(f"Detected blank value for minio access_key in {conf_path}. "
                         "This service may not work properly.")
 
-    try:
-        identity = conf.config.get('drakrun', 'identity')
-    except NoOptionError:
-        pass
-    else:
-        DrakrunKarton.identity = identity
-        logging.warning(f"Overriding identity to: {identity}")
+    unrecommended = validate_xen_commandline()
 
-    c = DrakrunKarton(conf)
+    if unrecommended:
+        logging.warning("-" * 80)
+        logging.warning("You don't have the recommended settings in your Xen's command line.")
+        logging.warning("Please amend settings in your GRUB_CMDLINE_XEN_DEFAULT in /etc/default/grub.d/xen.cfg file.")
+
+        for k, v, actual_v in unrecommended:
+            if actual_v is not None:
+                logging.warning(f"- Set {k}={v} (instead of {k}={actual_v})")
+            else:
+                logging.warning(f"- Set {k}={v} ({k} is not set right now)")
+
+        logging.warning("Then, please execute the following commands as root: update-grub && reboot")
+        logging.warning("-" * 80)
+        logging.warning("This check can be skipped by adding xen_cmdline_check=ignore in [drakrun] section of drakrun's config.")
+        logging.warning("Please be aware that some bugs may arise when using unrecommended settings.")
+
+        try:
+            xen_cmdline_check = conf.config.get('drakrun', 'xen_cmdline_check')
+        except NoOptionError:
+            xen_cmdline_check = 'fail'
+
+        if xen_cmdline_check == 'ignore':
+            logging.warning("ATTENTION! Configuration specified that check result should be ignored, continuing anyway...")
+        else:
+            logging.error("Exitting due to above warnings. Please ensure that you are using recommended Xen's command line.")
+            sys.exit(1)
+
+    # Apply Karton configuration overrides
+    drakrun_conf = conf.config["drakrun"] if conf.config.has_section("drakrun") else {}
+    DrakrunKarton.reconfigure(drakrun_conf)
+
+    c = DrakrunKarton(conf, args.instance)
     c.init_drakrun()
     c.loop()
 

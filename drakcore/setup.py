@@ -7,7 +7,7 @@ except ImportError:
 
 setup(
     name="drakcore",
-    version="0.10.0",
+    version="0.12.0",
     description="DRAKVUF Sandbox Core",
     package_dir={"drakcore": "drakcore"},
     packages=["drakcore", "drakcore.postprocess"],
@@ -18,7 +18,8 @@ setup(
              'drakcore/bin/drak-config-setup',
              'drakcore/bin/drak-postprocess',
              'drakcore/bin/drak-healthcheck',
-             'drakcore/bin/drak-vncpasswd'],
+             'drakcore/bin/drak-vncpasswd',
+             'drakcore/bin/drak-upgrade-db'],
     classifiers=[
         "Programming Language :: Python",
         "Operating System :: OS Independent",
