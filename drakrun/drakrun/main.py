@@ -19,6 +19,7 @@ from typing import Optional, List, Dict
 from pathlib import Path
 from stat import S_ISREG, ST_CTIME, ST_MODE, ST_SIZE
 from configparser import NoOptionError
+from itertools import chain
 
 import pefile
 import magic
@@ -113,6 +114,26 @@ class DrakrunKarton(Karton):
         with open(os.path.join(PROFILE_DIR, "runtime.json"), 'r') as runtime_f:
             self.runtime_info = RuntimeInfo.load(runtime_f)
 
+        self.active_plugins = {}
+        self.active_plugins["_all_"] = [
+            'apimon', 'bsodmon', 'clipboardmon', 'cpuidmon', 'crashmon',
+            'debugmon', 'delaymon', 'exmon', 'filedelete', 'filetracer',
+            'librarymon', 'memdump', 'procdump', 'procmon', 'regmon',
+            'rpcmon', 'ssdtmon', 'syscalls', 'tlsmon', 'windowmon',
+            'wmimon']
+
+        for quality, list_str in self.config.config.items('drakvuf_plugins'):
+            plugins = [x for x in list_str.split(',') if x.strip()]
+            self.active_plugins[quality] = plugins
+
+    def generate_plugin_cmdline(self, quality):
+        plugin_list = self.active_plugins["_all_"]
+
+        if quality in self.active_plugins:
+            plugin_list = self.active_plugins[quality]
+
+        return list(chain.from_iterable([["-a", plugin] for plugin in plugin_list]))
+
     @classmethod
     def reconfigure(cls, config: Dict[str, str]):
         """ Reconfigure DrakrunKarton class """
@@ -151,11 +172,11 @@ class DrakrunKarton(Karton):
         try:
             exports = [(e.ordinal, e.name.decode('utf-8', 'ignore')) for e in pe.DIRECTORY_ENTRY_EXPORT.symbols]
         except AttributeError:
-            return None
+            return 'regsvr32 /s %f'
 
         for export in exports:
             if export[1] == 'DllRegisterServer':
-                return 'regsvr32 %f'
+                return 'regsvr32 /s %f'
 
             if 'DllMain' in export[1]:
                 return 'rundll32 %f,{}'.format(export[1])
@@ -166,7 +187,7 @@ class DrakrunKarton(Karton):
             elif exports[0][0]:
                 return 'rundll32 %f,#{}'.format(export[0])
 
-        return None
+        return 'regsvr32 /s %f'
 
     @staticmethod
     def _get_office_file_run_command(extension, file_path):
@@ -219,6 +240,10 @@ class DrakrunKarton(Karton):
                 zipf.write(path, os.path.join("dumps", os.path.basename(path)))
             os.unlink(path)
 
+        # No dumps, force empty directory
+        if current_size == 0:
+            zipf.writestr(zipfile.ZipInfo("dumps/"), "")
+
         if current_size > max_total_size:
             self.log.error('Some dumps were deleted, because the configured size threshold was exceeded.')
 
@@ -228,6 +253,7 @@ class DrakrunKarton(Karton):
         for root, dirs, files in os.walk(dirpath):
             for file in files:
                 zipf.write(os.path.join(root, file), os.path.join("ipt", os.path.relpath(os.path.join(root, file), dirpath)))
+                os.unlink(os.path.join(root, file))
 
     def upload_artifacts(self, analysis_uid, workdir, subdir=''):
         base_path = os.path.join(workdir, 'output')
@@ -278,6 +304,18 @@ class DrakrunKarton(Karton):
 
         return snapshot_version
 
+    @property
+    def analysis_uid(self):
+        override_uid = self.current_task.payload.get('override_uid')
+
+        if override_uid:
+            return override_uid
+
+        if self.config.config.getboolean('drakrun', 'use_root_uid'):
+            return self.current_task.root_uid
+
+        return self.current_task.uid
+
     @with_logs('drakrun.log')
     def process(self):
         sample = self.current_task.get_resource("sample")
@@ -292,17 +330,8 @@ class DrakrunKarton(Karton):
             self.log.error("Tried to run the analysis for more than hard limit of %d seconds", hard_time_limit)
             return
 
-        analysis_uid = self.current_task.uid
-        override_uid = self.current_task.payload.get('override_uid')
-
-        self.log.info(f"analysis UID: {analysis_uid}")
-
-        if override_uid:
-            analysis_uid = override_uid
-            self.log.info(f"override UID: {override_uid}")
-            self.log.info("note that artifacts will be stored under this overriden identifier")
-
-        self.rs.set(f"drakvnc:{analysis_uid}", self.instance_id, ex=3600)  # 1h
+        self.log.info(f"analysis UID: {self.analysis_uid}")
+        self.rs.set(f"drakvnc:{self.analysis_uid}", self.instance_id, ex=3600)  # 1h
 
         workdir = f"/tmp/drakrun/{self.vm_name}"
 
@@ -393,13 +422,12 @@ class DrakrunKarton(Karton):
                 full_cmd = cur_start_command
                 self.log.info("Using command: %s", full_cmd)
 
-                drakvuf_cmd = ["drakvuf",
-                               "-o", "json",
-                               "-x", "poolmon",
-                               "-x", "objmon",
-                               "-x", "socketmon",
-                               "-x", "dkommon",
-                               "-x", "envmon",
+                task_quality = self.current_task.headers.get("quality", "high")
+
+                drakvuf_cmd = ["drakvuf"] + self.generate_plugin_cmdline(task_quality) + \
+                              ["-o", "json",
+                               # be aware of https://github.com/tklengyel/drakvuf/pull/951
+                               "-F",  # enable fast singlestep
                                "-j", "5",
                                "-t", str(timeout),
                                "-i", str(self.runtime_info.inject_pid),
@@ -473,7 +501,7 @@ class DrakrunKarton(Karton):
         with open(os.path.join(outdir, 'metadata.json'), 'w') as f:
             f.write(json.dumps(metadata))
 
-        payload = {"analysis_uid": analysis_uid}
+        payload = {"analysis_uid": self.analysis_uid}
         payload.update(metadata)
 
         headers = dict(self.headers)
@@ -481,7 +509,7 @@ class DrakrunKarton(Karton):
 
         t = Task(headers, payload=payload)
 
-        for resource in self.upload_artifacts(analysis_uid, workdir):
+        for resource in self.upload_artifacts(self.analysis_uid, workdir):
             t.add_payload(resource.name, resource)
 
         t.add_payload('sample', sample)

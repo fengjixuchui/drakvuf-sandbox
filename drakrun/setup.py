@@ -7,13 +7,13 @@ except ImportError:
 
 setup(
     name="drakrun",
-    version="0.12.0",
+    version="0.13.0",
     description="DRAKRUN",
     package_dir={"drakrun": "drakrun"},
     packages=["drakrun"],
     include_package_data=True,
     install_requires=open("requirements.txt").read().splitlines(),
-    scripts=['drakrun/py-scripts/drakrun', 'drakrun/py-scripts/draksetup', 'drakrun/py-scripts/drakpush'],
+    scripts=['drakrun/py-scripts/drakrun', 'drakrun/py-scripts/draksetup', 'drakrun/py-scripts/drakpush', 'drakrun/py-scripts/drakpdb'],
     classifiers=[
         "Programming Language :: Python",
         "Operating System :: OS Independent",
