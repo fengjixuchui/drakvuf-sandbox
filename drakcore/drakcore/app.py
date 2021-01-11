@@ -2,13 +2,15 @@ import json
 import os
 import re
 import pathlib
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, TemporaryDirectory
+from zipfile import ZipFile, ZIP_DEFLATED
 
 import requests
 import logging
 
 from flask import Flask, jsonify, request, send_file, redirect, send_from_directory, Response, abort
-from karton2 import Config, Producer, Task, Resource
+from karton.core import Config, Producer, Task, Resource
+from karton.core.task import TaskState
 from minio.error import NoSuchKey
 
 from drakcore.system import SystemService
@@ -20,8 +22,8 @@ from drakcore.database import Database
 app = Flask(__name__, static_folder='frontend/build/static')
 conf = get_config()
 
-rs = SystemService(conf).rs
-minio = SystemService(conf).minio
+backend = SystemService(conf).backend
+minio = backend.minio
 db = Database(conf.config["drakmon"].get("database", "sqlite:///var/lib/drakcore/drakcore.db"),
               pathlib.Path(__file__).parent / "migrations")
 
@@ -154,6 +156,30 @@ def logindex(task_uid, log_type):
         return send_file(f.name)
 
 
+@app.route("/pcap_dump/<task_uid>")
+def pcap_dump(task_uid):
+    """
+    Return archaive containing dump.pcap along with extracted tls sessions
+    keys in format acceptable by wireshark.
+    """
+    analysis = AnalysisProxy(minio, task_uid)
+    try:
+        with NamedTemporaryFile() as f_pcap, NamedTemporaryFile() as f_keys, NamedTemporaryFile() as f_archive:
+            with ZipFile(f_archive, 'w', ZIP_DEFLATED) as archive:
+                analysis.get_pcap_dump(f_pcap)
+                archive.write(f_pcap.name, 'dump.pcap')
+                try:
+                    analysis.get_wireshark_key_file(f_keys)
+                    archive.write(f_keys.name, 'dump.keys')
+                except NoSuchKey:
+                    # No dumped keys.
+                    pass
+            f_archive.seek(0)
+            return send_file(f_archive.name, mimetype='application/zip')
+    except NoSuchKey:
+        abort(404, description="No network traffic avaible.")
+
+
 @app.route("/dumps/<task_uid>")
 def dumps(task_uid):
     analysis = AnalysisProxy(minio, task_uid)
@@ -183,21 +209,15 @@ def metadata(task_uid):
 
 @app.route("/status/<task_uid>")
 def status(task_uid):
-    tasks = rs.keys("karton.task:*")
     res = {"status": "done"}
 
-    for task_key in tasks:
-        data = rs.get(task_key)
-        if not data:
-            continue
-        task = json.loads(data)
-
-        if task["root_uid"] == task_uid:
-            if task["status"] != "Finished":
+    for task in backend.get_all_tasks():
+        if task.root_uid == task_uid:
+            if task.status != TaskState.FINISHED:
                 res["status"] = "pending"
                 break
 
-    res["vm_id"] = rs.get(f"drakvnc:{task_uid}")
+    res["vm_id"] = backend.redis.get(f"drakvnc:{task_uid}")
     return jsonify(res)
 
 
