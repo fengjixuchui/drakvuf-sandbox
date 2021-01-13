@@ -27,6 +27,7 @@ import ntpath
 from karton.core import Karton, Config, Task, LocalResource
 
 import drakrun.office as d_office
+from drakrun.version import __version__ as DRAKRUN_VERSION
 from drakrun.drakpdb import dll_file_list
 from drakrun.config import InstallInfo, ETC_DIR, VM_CONFIG_DIR, VOLUME_DIR, PROFILE_DIR
 from drakrun.storage import get_storage_backend
@@ -87,6 +88,7 @@ def with_logs(object_name):
 
 
 class DrakrunKarton(Karton):
+    version = DRAKRUN_VERSION
     # Karton configuration defaults, may be overriden by config file
     DEFAULT_IDENTITY = "karton.drakrun-prod"
     DEFAULT_FILTERS = [
@@ -108,6 +110,13 @@ class DrakrunKarton(Karton):
 
     def __init__(self, config: Config, instance_id: int):
         super().__init__(config)
+
+        # Now that karton is set up we can plug in our logger
+        logger = logging.getLogger("drakrun")
+        for handler in self.log.handlers:
+            logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+
         self.instance_id = instance_id
         self.install_info = InstallInfo.load()
         self.default_timeout = int(self.config.config['drakrun'].get('analysis_timeout') or 60 * 10)

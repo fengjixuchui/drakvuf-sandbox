@@ -6,6 +6,9 @@ from typing import Optional
 from drakrun.util import get_domid_from_instance_id
 
 
+log = logging.getLogger("drakrun")
+
+
 def add_iptable_rule(rule):
     try:
         subprocess.check_output(f"iptables -C {rule}", shell=True)
@@ -18,14 +21,13 @@ def add_iptable_rule(rule):
             raise RuntimeError(f'Failed to check for iptables rule: {rule}')
 
 
-def start_tcpdump_collector(instance_id: str, outdir: str) -> Optional[subprocess.Popen]:
+def start_tcpdump_collector(instance_id: str, outdir: str) -> subprocess.Popen:
     domid = get_domid_from_instance_id(instance_id)
 
     try:
         subprocess.check_output("tcpdump --version", shell=True)
     except subprocess.CalledProcessError:
-        logging.warning("Seems like tcpdump is not working/not installed on your system. Pcap will not be recorded.")
-        return None
+        raise RuntimeError("Failed to start tcpdump")
 
     return subprocess.Popen([
         "tcpdump",
@@ -40,9 +42,7 @@ def start_dnsmasq(vm_id: int, dns_server: str, background=False) -> Optional[sub
     try:
         subprocess.check_output("dnsmasq --version", shell=True)
     except subprocess.CalledProcessError:
-        logging.warning("Seems like dnsmasq is not working/not installed on your system."
-                        "Guest networking may not be fully functional.")
-        return None
+        raise RuntimeError("Failed to start dnsmasq")
 
     if dns_server == "use-gateway-address":
         dns_server = f"10.13.{vm_id}.1"
@@ -57,9 +57,9 @@ def start_dnsmasq(vm_id: int, dns_server: str, background=False) -> Optional[sub
             try:
                 os.kill(dnsmasq_pid, 0)
             except OSError:
-                logging.info("Starting dnsmasq in background")
+                log.info("Starting dnsmasq in background")
             else:
-                logging.info("Already running dnsmasq in background")
+                log.info("Already running dnsmasq in background")
                 return
 
     return subprocess.Popen([
@@ -84,9 +84,9 @@ def setup_vm_network(vm_id, net_enable, out_interface, dns_server):
         subprocess.check_output(f'brctl addbr drak{vm_id}', stderr=subprocess.STDOUT, shell=True)
     except subprocess.CalledProcessError as e:
         if b'already exists' in e.output:
-            logging.info(f"Bridge drak{vm_id} already exists.")
+            log.info(f"Bridge drak{vm_id} already exists.")
         else:
-            logging.exception(f"Failed to create bridge drak{vm_id}.")
+            log.exception(f"Failed to create bridge drak{vm_id}.")
     else:
         subprocess.check_output(f'ip addr add 10.13.{vm_id}.1/24 dev drak{vm_id}', shell=True)
 
