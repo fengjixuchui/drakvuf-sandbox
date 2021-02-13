@@ -1,13 +1,15 @@
-import base64
+import contextlib
+import logging
 import os
 import re
-import sys
 import subprocess
+import sys
 from dataclasses import dataclass, field
-from typing import Dict, AnyStr, IO
+from typing import IO, AnyStr
 
-from karton.core import Config
-from dataclasses_json import dataclass_json, config
+from dataclasses_json import config, dataclass_json
+
+log = logging.getLogger("drakrun")
 
 hexstring = config(
     encoder=lambda v: hex(v),
@@ -35,6 +37,7 @@ class VmiOffsets:
 
     kpgd: int = field(metadata=hexstring)
 
+    @staticmethod
     def from_tool_output(output: str) -> 'VmiOffsets':
         """
         Parse vmi-win-offsets tool output and return VmiOffsets.
@@ -80,7 +83,7 @@ def patch_config(cfg):
     return cfg
 
 
-def get_domid_from_instance_id(instance_id: str) -> int:
+def get_domid_from_instance_id(instance_id: int) -> int:
     output = subprocess.check_output(["xl", "domid", f"vm-{instance_id}"])
     return int(output.decode('utf-8').strip())
 
@@ -115,3 +118,18 @@ def get_xen_commandline(parsed_xl_info):
             cfg[k] = v
 
     return cfg
+
+
+@contextlib.contextmanager
+def graceful_exit(proc: subprocess.Popen):
+    try:
+        yield proc
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(5)
+        except subprocess.TimeoutExpired as err:
+            log.error("Process %s doesn't exit after timeout.", err.cmd)
+            proc.kill()
+            proc.wait()
+            log.error("Process was forceully killed")
